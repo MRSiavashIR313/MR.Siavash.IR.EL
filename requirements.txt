@@ -2,3 +2,5 @@ flask
 pyTelegramBotAPI
 pillow
 requests
+cryptography
+waitress
