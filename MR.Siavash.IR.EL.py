@@ -17,7 +17,7 @@ import requests
 
 # ==================== CONFIG ====================
 class Config:
-    TOKEN = "8252901438:AAHSovrfEiu7_KvyINPInO1bu12ICyTLsD8"
+    TOKEN = os.environ.get("BOT_TOKEN", "8252901438:AAHSovrfEiu7_KvyINPInO1bu12ICyTLsD8")
     ADMIN_ID = 6848904786
     PORT = int(os.environ.get("PORT", 8080))
     REDIRECT_URL = "https://www.digikala.com"
@@ -1055,4 +1055,5 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("\n👋 System shutdown requested")
+
         log.info(f"⏳ Total uptime: {datetime.now() - start_time}")
